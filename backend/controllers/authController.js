@@ -16,7 +16,7 @@ const generateToken = (userId, roleId) => {
 
 // --- [PERBAIKAN] Ganti 'exports.registerUser' menjadi 'export const' ---
 export const registerUser = async (req, res) => {
-  const { nama_lengkap, username, password, role_id, divisi_id } = req.body;
+  const { nama_lengkap, username, email, password, role_id, divisi_id } = req.body;
 
   if (!nama_lengkap || !username || !password || !role_id) {
     return res.status(400).json({ msg: 'Mohon isi semua field yang wajib.' });
@@ -36,10 +36,17 @@ export const registerUser = async (req, res) => {
     const password_hash = await bcrypt.hash(password, salt);
 
     const [result] = await pool.query(
-      'INSERT INTO users (nama_lengkap, username, password_hash, role_id, divisi_id) VALUES (?, ?, ?, ?, ?)',
-      [nama_lengkap, username, password_hash, role_id, divisi_id || null]
+      'INSERT INTO users (nama_lengkap, username, email, password_hash, role_id, divisi_id) VALUES (?, ?, ?, ?, ?, ?)',
+      [nama_lengkap, username, email || null, password_hash, role_id, divisi_id || null]
     );
 
+    // Log aktivitas
+    const ipAddress = req.ip || req.connection.remoteAddress || null;
+    const adminId = req.user?.user_id; // Jika ada admin yang register user
+    if (adminId) {
+      await logUserActivity(adminId, `Mendaftarkan user baru: ${username}`, ipAddress);
+    }
+    
     res.status(201).json({ 
       msg: 'User berhasil terdaftar',
       userId: result.insertId 

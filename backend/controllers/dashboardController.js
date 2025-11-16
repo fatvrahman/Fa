@@ -4,17 +4,25 @@ import { pool } from '../config/db.js';
 // Get dashboard statistics
 export const getDashboardStats = async (req, res) => {
   try {
-    // Total Active Products
-    const [produkCount] = await pool.query(
-      `SELECT COUNT(DISTINCT p.produk_id) as count 
-       FROM produk p
-       INNER JOIN (
-         SELECT produk_id FROM stok_wh01 WHERE is_active = 1
-         UNION
-         SELECT produk_id FROM stok_wh02 WHERE is_active = 1
-         UNION
-         SELECT produk_id FROM stok_wh03 WHERE is_active = 1
-       ) active_stock ON p.produk_id = active_stock.produk_id`
+    // Total Stock Available and Product Count
+    const [stockTotal] = await pool.query(
+      `SELECT 
+         COUNT(DISTINCT p.produk_id) as product_count,
+         (
+           SELECT SUM(
+             CASE 
+               WHEN konversi_tengah > 0 AND konversi_pcs > 0 THEN
+                 (COALESCE(sistem_karton, 0) * konversi_pcs) + 
+                 (COALESCE(sistem_tengah, 0) * konversi_tengah) + 
+                 COALESCE(sistem_pieces, 0)
+               ELSE 0
+             END
+           )
+           FROM produk p2
+           JOIN stok_wh01 s1 ON p2.produk_id = s1.produk_id
+           WHERE s1.is_active = 1
+         ) as total_stock
+       FROM produk p`
     );
 
     // User Opname Performance
@@ -194,7 +202,8 @@ export const getDashboardStats = async (req, res) => {
     });
 
     res.json({
-      totalProduk: produkCount[0].count,
+      totalProduk: stockTotal[0].product_count,
+      totalStock: stockTotal[0].total_stock,
       totalUser: userCount[0].count,
       opnameStats: {
         inProgress: opnameStats[0].in_progress,
@@ -210,6 +219,120 @@ export const getDashboardStats = async (req, res) => {
 
   } catch (error) {
     console.error('Error fetching dashboard stats:', error.message);
+    res.status(500).json({ msg: 'Server Error', error: error.message });
+  }
+};
+
+// Get additional dashboard metrics
+export const getAdditionalMetrics = async (req, res) => {
+  try {
+    // Total Batch Completed this month
+    const [completedBatch] = await pool.query(
+      `SELECT COUNT(*) as count 
+       FROM opname_batch 
+       WHERE status_overall = 'Completed' 
+       AND MONTH(created_at) = MONTH(CURRENT_DATE())
+       AND YEAR(created_at) = YEAR(CURRENT_DATE())`
+    );
+
+    // Average Completion Rate
+    const [avgCompletionRate] = await pool.query(
+      `SELECT 
+         COUNT(DISTINCT oa.assignment_id) as total_assignments,
+         SUM(CASE WHEN oa.status_assignment IN ('Submitted', 'Approved') THEN 1 ELSE 0 END) as completed_assignments
+       FROM opname_assignment oa`
+    );
+
+    const completionRate = avgCompletionRate[0].total_assignments > 0
+      ? (avgCompletionRate[0].completed_assignments / avgCompletionRate[0].total_assignments) * 100
+      : 0;
+
+    // Assignment Pending Approval
+    const [pendingApproval] = await pool.query(
+      `SELECT COUNT(*) as count 
+       FROM opname_assignment 
+       WHERE status_assignment = 'Submitted'`
+    );
+
+    // Top User with most tasks
+    const [topUser] = await pool.query(
+      `SELECT 
+         u.nama_lengkap,
+         r.nama_role,
+         d.kode_divisi,
+         d.nama_divisi,
+         COUNT(DISTINCT oa.assignment_id) as task_count
+       FROM users u
+       JOIN roles r ON u.role_id = r.role_id
+       LEFT JOIN divisi d ON u.divisi_id = d.divisi_id
+       LEFT JOIN opname_assignment oa ON u.user_id = oa.user_id
+       WHERE u.is_active = 1
+       AND oa.assigned_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)
+       GROUP BY u.user_id
+       ORDER BY task_count DESC
+       LIMIT 1`
+    );
+
+    // Warehouse breakdown
+    const [warehouseBreakdown] = await pool.query(
+      `SELECT
+         'WH01' as warehouse_code,
+         COUNT(DISTINCT s.produk_id) as products,
+         SUM(CASE WHEN sistem_karton > 0 OR sistem_tengah > 0 OR sistem_pieces > 0 THEN 1 ELSE 0 END) as in_stock,
+         SUM(sistem_karton + sistem_tengah + sistem_pieces) as total_items
+       FROM stok_wh01 s
+       WHERE s.is_active = 1
+       UNION ALL
+       SELECT 
+         'WH02',
+         COUNT(DISTINCT s.produk_id),
+         SUM(CASE WHEN sistem_total_pcs > 0 THEN 1 ELSE 0 END),
+         SUM(sistem_total_pcs)
+       FROM stok_wh02 s
+       WHERE s.is_active = 1
+       UNION ALL
+       SELECT
+         'WH03',
+         COUNT(DISTINCT s.produk_id),
+         SUM(CASE WHEN sistem_total_pcs > 0 THEN 1 ELSE 0 END),
+         SUM(sistem_total_pcs)
+       FROM stok_wh03 s
+       WHERE s.is_active = 1`
+    );
+
+    // Total Rupiah: Sum of all products' value
+    // Formula: (TOTAL IN PCS / konversi_pcs) * HJE per karton
+    // Example: product 410549 with total_in_pcs=4120, konversi_pcs=88, hje=1000000
+    // = (4120 / 88) * 1000000 = 46,818,181.82 → rounded to Rp46,818,182
+    const [totalRupiah] = await pool.query(
+      `SELECT 
+         ROUND(SUM(
+           CASE 
+             WHEN p.konversi_pcs > 0 AND p.hje_per_karton > 0 THEN
+               ((COALESCE(s.sistem_karton, 0) * p.konversi_pcs + 
+                 COALESCE(s.sistem_tengah, 0) * p.konversi_tengah + 
+                 COALESCE(s.sistem_pieces, 0)) / p.konversi_pcs) * p.hje_per_karton
+             ELSE 0
+           END
+         )) as total_value
+       FROM produk p
+       LEFT JOIN stok_wh01 s ON p.produk_id = s.produk_id
+       WHERE s.is_active = 1 
+         AND p.konversi_pcs > 0 
+         AND p.hje_per_karton > 0`
+    );
+
+    res.json({
+      completedBatchThisMonth: completedBatch[0].count,
+      avgCompletionRate: Math.round(completionRate),
+      pendingApproval: pendingApproval[0].count,
+      topUser: topUser[0] || { nama_lengkap: '-', nama_role: '-', nama_divisi: '-', task_count: 0 },
+      warehouseBreakdown,
+      totalRupiah: totalRupiah[0].total_value || 0
+    });
+
+  } catch (error) {
+    console.error('Error fetching additional metrics:', error.message);
     res.status(500).json({ msg: 'Server Error', error: error.message });
   }
 };

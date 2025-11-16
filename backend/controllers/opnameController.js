@@ -2,6 +2,7 @@
 import { pool } from '../config/db.js';
 import ExcelJS from 'exceljs';
 import PDFDocument from 'pdfkit'; // <-- [FIX] Tambahin import PDF
+import { logUserActivity } from './userController.js';
 
 // Helper untuk mengambil tipe opname dari assignment_id
 const getOpnameType = async (connection, assignment_id) => {
@@ -282,6 +283,11 @@ export const createOpnameBatch = async (req, res) => {
     }
 
     await connection.commit();
+    
+    // Log aktivitas
+    const ipAddress = req.ip || req.connection.remoteAddress || null;
+    await logUserActivity(created_by, `Membuat batch opname: ${nama_batch}`, ipAddress);
+    
     res.status(201).json({ msg: 'Batch opname berhasil dibuat.' });
   } catch (error) {
     if (connection) await connection.rollback();
@@ -380,7 +386,7 @@ export const getAssignmentDetailsForAdmin = async (req, res) => {
         ob.tipe_opname,
         d.nama_divisi,
         d.kode_divisi,
-        d.kode_divisi as divisi_lengkap,
+        CONCAT(d.kode_divisi, ' - ', d.nama_divisi) as divisi_lengkap,
         ob.tipe_opname as nama_gudang
        FROM opname_assignment oa
        JOIN users u ON oa.user_id = u.user_id
@@ -462,6 +468,12 @@ export const approveOrRejectAssignment = async (req, res) => {
     await checkBatchCompletion(connection, batch_id);
 
     await connection.commit();
+    
+    // Log aktivitas
+    const ipAddress = req.ip || req.connection.remoteAddress || null;
+    const action = status === 'Approved' ? 'Menyetujui' : 'Menolak';
+    await logUserActivity(admin_id, `${action} hasil opname (Assignment ID: ${assignment_id})`, ipAddress);
+    
     res.json({ msg: `Tugas berhasil di-${status}.` });
 
   } catch (error) {
@@ -477,58 +489,103 @@ export const approveOrRejectAssignment = async (req, res) => {
 export const deleteAssignment = async (req, res) => {
   const { assignment_id } = req.params;
   
-  try {
-    // Cek status assignment
-    const [rows] = await pool.query(
-      'SELECT status_assignment, batch_id FROM opname_assignment WHERE assignment_id = ?',
-      [assignment_id]
-    );
-    
-    if (!rows || rows.length === 0) {
-      return res.status(404).json({ msg: 'Assignment tidak ditemukan.' });
-    }
-    
-    const assignment = rows[0];
-    
-    // Hanya boleh delete jika status Pending atau In Progress (belum submit)
-    if (assignment.status_assignment === 'Submitted' || 
-        assignment.status_assignment === 'Approved' || 
-        assignment.status_assignment === 'Rejected') {
-      return res.status(400).json({ 
-        msg: `Assignment dengan status ${assignment.status_assignment} tidak dapat dihapus.` 
-      });
-    }
-    
-    const batch_id = assignment.batch_id;
-    
-    // Delete assignment - CASCADE akan otomatis delete details
-    const [deleteResult] = await pool.query(
-      'DELETE FROM opname_assignment WHERE assignment_id = ?', 
-      [assignment_id]
-    );
-    
-    // Cek apakah masih ada assignment lain di batch yang sama
-    const [remainingRows] = await pool.query(
-      'SELECT COUNT(*) as count FROM opname_assignment WHERE batch_id = ?',
-      [batch_id]
-    );
-    
-    // Jika tidak ada assignment lagi, update batch status kembali ke Draft
-    if (remainingRows[0].count === 0) {
-      await pool.query(
-        'UPDATE opname_batch SET status_overall = ? WHERE batch_id = ?',
-        ['Draft', batch_id]
+  let connection;
+  let retries = 3;
+  
+  while (retries > 0) {
+    try {
+      connection = await pool.getConnection();
+      await connection.beginTransaction();
+      
+      // Cek status assignment dengan lock
+      const [rows] = await connection.query(
+        'SELECT status_assignment, batch_id FROM opname_assignment WHERE assignment_id = ? FOR UPDATE',
+        [assignment_id]
       );
+      
+      if (!rows || rows.length === 0) {
+        await connection.rollback();
+        return res.status(404).json({ msg: 'Assignment tidak ditemukan.' });
+      }
+      
+      const assignment = rows[0];
+      
+      // Hanya boleh delete jika status Pending atau In Progress (belum submit)
+      if (assignment.status_assignment === 'Submitted' || 
+          assignment.status_assignment === 'Approved' || 
+          assignment.status_assignment === 'Rejected') {
+        await connection.rollback();
+        return res.status(400).json({ 
+          msg: `Assignment dengan status ${assignment.status_assignment} tidak dapat dihapus.` 
+        });
+      }
+      
+      const batch_id = assignment.batch_id;
+      
+      // Delete assignment details first (manual cascade if needed)
+      await connection.query(
+        'DELETE FROM opname_details_wh01 WHERE assignment_id = ?',
+        [assignment_id]
+      );
+      
+      await connection.query(
+        'DELETE FROM opname_details_wh02 WHERE assignment_id = ?',
+        [assignment_id]
+      );
+      
+      await connection.query(
+        'DELETE FROM opname_details_wh03 WHERE assignment_id = ?',
+        [assignment_id]
+      );
+      
+      // Delete assignment
+      await connection.query(
+        'DELETE FROM opname_assignment WHERE assignment_id = ?', 
+        [assignment_id]
+      );
+      
+      // Cek apakah masih ada assignment lain di batch yang sama
+      const [remainingRows] = await connection.query(
+        'SELECT COUNT(*) as count FROM opname_assignment WHERE batch_id = ?',
+        [batch_id]
+      );
+      
+      // Jika tidak ada assignment lagi, update batch status kembali ke Draft
+      if (remainingRows[0].count === 0) {
+        await connection.query(
+          'UPDATE opname_batch SET status_overall = ? WHERE batch_id = ?',
+          ['Draft', batch_id]
+        );
+      }
+      
+      await connection.commit();
+      
+      res.json({ msg: 'Assignment berhasil dihapus.' });
+      break; // Success, exit retry loop
+      
+    } catch (error) {
+      if (connection) await connection.rollback();
+      
+      // Check if it's a deadlock error
+      if (error.code === 'ER_LOCK_DEADLOCK' && retries > 1) {
+        retries--;
+        console.log(`Deadlock detected, retrying... (${3 - retries}/3)`);
+        // Wait a bit before retrying
+        await new Promise(resolve => setTimeout(resolve, 100 * (4 - retries)));
+        continue;
+      }
+      
+      // If not a deadlock or out of retries, return error
+      console.error('Error deleting assignment:', error);
+      return res.status(500).json({ 
+        msg: error.code === 'ER_LOCK_DEADLOCK' 
+          ? 'Terjadi konflik saat menghapus assignment. Silakan coba lagi.' 
+          : 'Server Error', 
+        error: error.message 
+      });
+    } finally {
+      if (connection) connection.release();
     }
-    
-    res.json({ msg: 'Assignment berhasil dihapus.' });
-    
-  } catch (error) {
-    console.error('Error deleting assignment:', error);
-    res.status(500).json({ 
-      msg: 'Server Error', 
-      error: error.message 
-    });
   }
 };
 
@@ -540,7 +597,7 @@ export const getAllActiveAssignments = async (req, res) => {
          u.nama_lengkap as nama_user, 
          d.nama_divisi, 
          d.kode_divisi,
-         d.kode_divisi as divisi_lengkap,
+         CONCAT(d.kode_divisi, ' - ', d.nama_divisi) as divisi_lengkap,
          b.nama_batch, 
          b.tipe_opname,
          b.created_at,
@@ -570,7 +627,7 @@ export const getSingleAssignmentInfo = async (req, res) => {
               u.nama_lengkap as nama_user, 
               d.nama_divisi, 
               d.kode_divisi,
-              d.kode_divisi as divisi_lengkap,
+              CONCAT(d.kode_divisi, ' - ', d.nama_divisi) as divisi_lengkap,
               b.nama_batch, b.tipe_opname
        FROM opname_assignment a
        LEFT JOIN users u ON a.user_id = u.user_id
@@ -1106,6 +1163,10 @@ export const submitOpname = async (req, res) => {
       "UPDATE opname_assignment SET status_assignment = 'Submitted', submitted_at = NOW() WHERE assignment_id = ?",
       [assignment_id]
     );
+    
+    // Log aktivitas
+    const ipAddress = req.ip || req.connection.remoteAddress || null;
+    await logUserActivity(user_id, `Submit hasil opname (Assignment ID: ${assignment_id})`, ipAddress);
     
     res.json({ msg: 'Opname berhasil di-submit dan akan diverifikasi oleh Admin.' });
 

@@ -1,6 +1,6 @@
 // path: api/routes/dashboard.js
 import express from 'express';
-import { getDashboardStats, getMonthlyStats } from '../controllers/dashboardController.js';
+import { getDashboardStats, getMonthlyStats, getAdditionalMetrics } from '../controllers/dashboardController.js';
 import { authenticateToken } from '../middleware/authMiddleware.js';
 
 const router = express.Router();
@@ -13,5 +13,8 @@ router.get('/stats', getDashboardStats);
 
 // Get monthly statistics
 router.get('/monthly', getMonthlyStats);
+
+// Get additional metrics
+router.get('/metrics', getAdditionalMetrics);
 
 export default router;

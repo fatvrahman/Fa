@@ -6,7 +6,7 @@ import bcrypt from 'bcryptjs';
 export const getAllUsers = async (req, res) => {
   try {
     const [users] = await pool.query(
-      `SELECT u.user_id, u.nama_lengkap, u.username, u.is_active, 
+      `SELECT u.user_id, u.nama_lengkap, u.username, u.email, u.role_id, u.divisi_id, u.is_active, 
               r.nama_role, d.nama_divisi, d.kode_divisi
        FROM users u
        JOIN roles r ON u.role_id = r.role_id
@@ -34,6 +34,15 @@ export const updateUser = async (req, res) => {
         'UPDATE users SET is_active = ? WHERE user_id = ?',
         [is_active ? 1 : 0, id]
       );
+      
+      // Log aktivitas
+      const adminId = req.user?.user_id;
+      const ipAddress = req.ip || req.connection.remoteAddress || null;
+      if (adminId) {
+        const statusText = is_active ? 'mengaktifkan' : 'menonaktifkan';
+        await logUserActivity(adminId, `Update status user: ${statusText} user ID ${id}`, ipAddress);
+      }
+      
       return res.json({ msg: 'Status user berhasil diupdate' });
     }
 
@@ -69,6 +78,13 @@ export const updateUser = async (req, res) => {
         'UPDATE users SET password_hash = ? WHERE user_id = ?',
         [password_hash, id]
       );
+    }
+    
+    // Log aktivitas
+    const adminId = req.user?.user_id;
+    const ipAddress = req.ip || req.connection.remoteAddress || null;
+    if (adminId) {
+      await logUserActivity(adminId, `Update data user: ${username} (ID: ${id})`, ipAddress);
     }
 
     res.json({ msg: 'User berhasil diupdate' });
@@ -110,6 +126,13 @@ export const deleteUser = async (req, res) => {
 
     if (result.affectedRows === 0) {
       return res.status(404).json({ msg: 'User tidak ditemukan' });
+    }
+    
+    // Log aktivitas
+    const adminId = req.user?.user_id;
+    const ipAddress = req.ip || req.connection.remoteAddress || null;
+    if (adminId) {
+      await logUserActivity(adminId, `Menghapus user: ${userToDelete[0].nama_lengkap} (ID: ${id})`, ipAddress);
     }
 
     res.json({ msg: 'User berhasil dihapus' });

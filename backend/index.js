@@ -11,6 +11,7 @@ import masterDataRoutes from './routes/masterData.js';
 import userRoutes from './routes/user.js';
 import opnameRoutes from './routes/opname.js';
 import dashboardRoutes from './routes/dashboard.js';
+import alertRoutes from './routes/alert.js';
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -34,6 +35,7 @@ app.use('/api/master', masterDataRoutes);
 app.use('/api/users', userRoutes);
 app.use('/api/opname', opnameRoutes);
 app.use('/api/dashboard', dashboardRoutes);
+app.use('/api/alerts', alertRoutes);
 
 app.listen(PORT, () => {
   console.log(`Running in http://localhost:${PORT}`);
